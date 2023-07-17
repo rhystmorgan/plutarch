@@ -1,0 +1,152 @@
+---------------------------------------------------------------------------------
+-- Minting Policy
+---------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------
+-- 3 Scripts -- Non Cyclical Dependancy
+----------------------------------------------------------------------------------------------
+
+-- The problem we are solving here is that anyone can send whatever they want to the validator
+-- if we have a case where the value of the datum stored at the contract is important, and we need to make sure the datum is correct
+-- we have a problem because we wont be able to identify which one is correct
+-- we dont check for an input at the address, we are looking for an output that goes to that address
+-- so we are applying this minting policy which checks for txs being sent to validator for datum and pubkey info
+-- if this info is correct, then we will also mint a token into this utxo, 
+-- that way we can identify the correct utxo at the given Validator address
+-- if the token exists, then we know that tx is official essentially
+-- so other scripts can check for the utxo with this token at Validator address
+
+data MintValidityToken = MintVToken | BurnVToken
+
+-- takes the validatorHash for the multisig
+-- we need to get the outputs of this tx, find outputs that go to multisig VH check there is one and enforce whatever is in the datum
+
+mkMintingPolicy :: ValidatorHash -> TxOutRef -> MintValidityToken -> ScriptContext -> ()
+mkMintingPolicy multisigVH oref redeemer ctx = mustSpendTxOutRef oref (txInfoInputs info) && checkMultiSigOutput
+    where
+        info = scriptContextTxInfo ctx 
+
+        outputsToMultisig :: [TxOut]
+        outputsToMultisig =  
+            filter
+                (\o ->
+                    (case txOutAddress o of
+                        Address (PubKeyCredential pkh) _ -> False
+                        Address (ScriptCredential valHash) _ -> valHAsh == multisigVH)
+                )
+                txInfoOutputs info
+
+        checkMultiSigOutput = 
+            case outputsToMultisig of
+                [msOutput] ->
+                    case txOutDatum msOutput of
+                        OutputDatum (Datum dbs) -> checkDatum (unsafeFromBuiltinData dbs)
+                        _ -> error
+                        && case flattenValue (txOutValue msOutput) of 
+                        [("", "", 2_000_000), (ownPolicyId, "authToken", 1)] -> 
+                            flattenValue (txInfoMint info) == [(ownPolicyId, "authToken", 1)]
+                         _ -> error
+                _ -> error
+        
+        checkDatum :: Input -> Bool
+        checkDatum datum = datum == Input {iRequiredCount = 1, iKeys = ["somePKH"]}
+
+-- Input is the Datum of the Multisig above --
+-- here the Validator Hash doesnt know about the MintingPolicy because it doesnt need to
+
+mkProjectTokenPolicy :: ValidatorHash -> CurrencySymbol -> MintValidityToken -> ScriptContext -> ()
+mkProjectTokenPolicy multisigVH authTokenCS redeemer ctx = traceIfFalse "no input from Multisig" inputsFromMultisig
+    where
+        info = scriptContextTxInfo ctx 
+
+        inputFromMultisig :: Bool
+        inputFromMultisig = 
+            length
+                (filter
+                    (\i ->
+                        (case txOutAddress (txInInfoResolved i) of
+                            Address (PubKeyCredential pkh) _ -> False
+                            Address (ScriptCredential valHash) _ -> valHAsh == multisigVH)
+                        && pvalueOf (txOutValue (txInInfoResolved i)) authTokenCS "authToken" == 1
+                    )
+                    txInfoOutputs info) == 1
+
+-- the first script is a validity Token, the second one mints the project token if the validity token is correct
+
+-- (psymbolValueOf value cs)
+
+-----------------------------------------------------------------------------------------
+-- 2 Scripts -- Cyclical dependancy
+-----------------------------------------------------------------------------------------
+
+-- if we need the Validator hash to know about this token, we can make
+-- the token name of the mintingpolicy equal the validator hash that it is spending to
+
+mkMintingPolicy :: ValidatorHash -> MintValidityToken -> ScriptContext -> ()
+mkMintingPolicy multisigVH redeemer ctx = 
+    where
+        info = scriptContextTxInfo ctx 
+
+        ownPolicyId :: CurrencySymbol -- check it is minting and get its policy ID
+        ownPolicyId = case scriptContextPurpose ctx of
+            Minting ownPolicyID' -> ownPolicyId'
+            _ -> error
+
+        outputsToScript :: [TxOut] -- all outputs to scripts
+        outputsToScript =
+            filter
+                (\o ->
+                    (case txOutAddress o of
+                        Address (PubKeyCredential _) _ -> False
+                        Address (ScriptCredential _) _ -> True)
+                )
+                txInfoOutputs info
+
+        checkMultiSigOutput :: Bool
+        checkMultiSigOutput = -- check there is one output that goes to scripts and the output datum is the right datum
+            case outputsToScript of
+                [msOutput] ->
+                    (case txOutDatum msOutput of
+                        OutputDatum (Datum dbs) -> checkDatum (unsafeFromBuiltinData dbs)
+                        _ -> error)
+                    && case flattenValue (txOutValue msOutput) of -- flatten the value into a tuple
+                        [("", "", 2_000_000), (ownPolicyId, tkName, 1)] -> 
+                            let (Address (ScriptCredential vh) _) = (txOutAddress msOutput)
+                              in tkName == vh && flattenValue (txInfoMint info) == [(ownPolicyId, tkName, 1)]-- make sure the minted token name is the same as the validator hash it is sending to
+                         _ -> error
+                _ -> error
+        
+        checkDatum :: Input -> Bool
+        checkDatum datum = datum == Input {iRequiredCount = 1, iKeys = ["somePKH"]}
+
+-- This minting policy
+
+-- we get all script address outputs, then we check that there is only one, then check it has the correct datum,
+-- if we flatten the value of the output, it has 2 ADA and 1 of this policy's token
+-- check the token name is equal to the VH hash of the output
+-- to implement this we just make the VH check for this policy ID and it just checks the token name for that Policy ID is equal to its own validator Hash
+
+-- Multisig Script needs to know about our minting Policy, so it has that minting policy
+-- Multisig has the currency symbol of our mintingPolicy
+-- Find Own Input && check for minting policy or curSymbol && tokenName == ownValidatorHash
+
+-- Minting Policy
+-- 1 input from our wallet
+-- 1 Output to always Succeeds Script
+    -- value: 2 Ada & 1 from this currency symbol
+    -- datum: Input {iRequiredCount = 1, iKeys = ["deadbeef"]}
+-- 1 Minted Token
+    -- tokenName: validatorHash of alwaysSucceedsScript
+    -- cs: ownPolicyId
+
+-- the minting policy doesnt need to know about the ValidatorHash 
+
+----------------------------------------------------------------------------------------------
+
+-- One good thing to do for my own development is create and implement these 2 and 3 script patterns
+-- this will allow me to understand the processes and how / when to implement them to solve problems
+-- This is not the only one, there are a few other patterns in the plutonomicon that I should
+-- implement and understand for the same reason.
+-- this includes building the offchain code in Lucid or something else so I can runt them and see how they work
+
+----------------------------------------------------------------------------------------------
